@@ -371,6 +371,10 @@ const ERROR_HINTS = {
   GEMINI_FORBIDDEN: 'API キーの権限をご確認ください。',
   GEMINI_TOO_LONG: '動画が長すぎて処理できませんでした。「字幕から要約」に切り替えるとうまくいくことがあります。',
   GEMINI_EMPTY: '限定公開・非公開の動画は Gemini では扱えません。公開動画をお試しください。',
+  GEMINI_VIDEO_UNAVAILABLE: '公開動画でお試しください。',
+  GEMINI_TIMEOUT: '動画が長い場合は「要約の長さ」を短めにするか、時間をおいてお試しください。',
+  GEMINI_UNAVAILABLE: 'Cloudflare の設定で GEMINI_API_KEY を確認してください。',
+  NETWORK: '通信環境をご確認のうえ、もう一度お試しください。',
   GEMINI_ERROR: '「字幕から要約」に切り替えるとうまくいくことがあります。',
 };
 
@@ -461,6 +465,7 @@ form.addEventListener('submit', async (e) => {
   if (!urls.length) return;
 
   const length = form.querySelector('input[name="length"]:checked').value;
+  const review = $('review').checked;
 
   // 表示をリセット
   alertBox.classList.remove('on');
@@ -475,32 +480,10 @@ form.addEventListener('submit', async (e) => {
   submittedEngine = selectedEngine() ?? engines[0];
 
   try {
-    const res = await fetch('/api/summarize', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ urls, length, review: $('review').checked, engine: requestedEngine() }),
-      signal: controller.signal,
-    });
-
-    if (!res.ok) {
-      const data = await res.json().catch(() => ({}));
-      throw new Error(data.error ?? `サーバーエラー (HTTP ${res.status})`);
-    }
-
-    const reader = res.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-
-      let sep;
-      while ((sep = buffer.indexOf('\n\n')) !== -1) {
-        handleEvent(buffer.slice(0, sep));
-        buffer = buffer.slice(sep + 2);
-      }
+    if (submittedEngine === 'gemini') {
+      await runGeminiBatch(urls, { length, review, signal: controller.signal });
+    } else {
+      await streamCaptions({ urls, length, review }, { signal: controller.signal });
     }
   } catch (err) {
     if (err.name !== 'AbortError') {
@@ -514,7 +497,45 @@ form.addEventListener('submit', async (e) => {
   }
 });
 
-function handleEvent(block) {
+// ---------------------------------------------------------------------------
+// 字幕経路: サーバーが SSE で進捗と本文を流す
+// ---------------------------------------------------------------------------
+
+/**
+ * 字幕経路で要約する。target を渡すと、サーバーが返す1本目をそのカードに流し込む。
+ * Gemini が使えなかった動画を字幕経路で作り直すときに使う。
+ */
+async function streamCaptions(payload, { signal, target = null } = {}) {
+  const res = await fetch('/api/summarize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error ?? `サーバーエラー (HTTP ${res.status})`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let sep;
+    while ((sep = buffer.indexOf('\n\n')) !== -1) {
+      handleEvent(buffer.slice(0, sep), target);
+      buffer = buffer.slice(sep + 2);
+    }
+  }
+}
+
+function handleEvent(block, target = null) {
   let event = 'message';
   let dataLine = '';
   for (const line of block.split('\n')) {
@@ -526,7 +547,14 @@ function handleEvent(block) {
   let data;
   try { data = JSON.parse(dataLine); } catch { return; }
 
-  const item = typeof data.index === 'number' ? items.get(data.index) : null;
+  // 1枚のカードに流し込む場合は、一覧全体に関わるイベントを無視する
+  if (target && (event === 'queue' || event === 'done')) return;
+  if (target && event === 'fatal') {
+    markError(target, { code: 'INTERNAL', message: data.message });
+    return;
+  }
+
+  const item = target ?? (typeof data.index === 'number' ? items.get(data.index) : null);
 
   if (event === 'queue') {
     for (const q of data.items) createItem(q.index, q.videoId, q.input);
@@ -542,33 +570,22 @@ function handleEvent(block) {
   }
 
   else if (event === 'status') {
-    if (item) {
-      item.badgeEl.textContent = '処理中';
-      // Gemini が使えず字幕ベースに切り替えた場合は、カードにも残す
-      if (data.phase === 'fallback') item.noteEl.textContent = data.message ?? '';
-    }
+    if (item) item.badgeEl.textContent = '処理中';
     setProgress(data.message ?? '処理中…');
   }
 
   else if (event === 'meta') {
     if (!item) return;
-    item.title = data.title;
-    item.titleEl.textContent = data.title;
-    item.el.querySelector('img').src = `https://i.ytimg.com/vi/${encodeURIComponent(data.videoId)}/mqdefault.jpg`;
-    const bits = [data.author, formatDuration(data.lengthSeconds)].filter(Boolean);
-    if (data.source === 'gemini') {
-      bits.push('音声と画面を解析');
-    } else if (data.captionLanguage) {
-      bits.push(`字幕: ${data.captionLanguage}${data.captionIsAsr ? '（自動生成）' : ''}`);
-    }
-    item.metaEl.textContent = bits.join(' ・ ');
+    const bits = [data.author, formatDuration(data.lengthSeconds)];
+    if (data.captionLanguage) bits.push(`字幕: ${data.captionLanguage}${data.captionIsAsr ? '（自動生成）' : ''}`);
+    applyMeta(item, data.videoId, data.title, bits);
   }
 
   else if (event === 'reset') {
     if (!item) return;
     item.markdown = data.text ?? '';
     item.bodyEl.innerHTML = item.markdown
-      ? renderMarkdown(item.markdown, item.videoId)
+      ? `<div class="summary">${renderMarkdown(item.markdown, item.videoId)}</div>`
       : '<p style="color:var(--muted)">検証結果を反映しています…</p>';
   }
 
@@ -580,56 +597,314 @@ function handleEvent(block) {
 
   else if (event === 'item-done') {
     if (!item) return;
-    item.el.classList.add('done');
-    item.badgeEl.textContent = '完了';
-    item.bodyEl.innerHTML = `<div class="summary">${renderMarkdown(item.markdown, item.videoId)}</div>`;
-    addActions(item);
-
     const notes = [];
+    if (item.fellBack) notes.push(item.fellBack);
     if (data.sampled) notes.push('動画が長いため、字幕の一部を抜粋して要約しています。');
     if (data.reviewError) notes.push('検証パスが失敗したため、検証前の内容を表示しています。');
-    if (data.model) {
-      notes.push(`${data.engine === 'gemini' ? '動画を解析' : '字幕から要約'} / ${data.model}`);
-    }
-    item.noteEl.textContent = notes.join(' ');
+    if (data.model) notes.push(`字幕から要約 / ${data.model}`);
+    markDone(item, notes);
   }
 
   else if (event === 'item-error') {
-    if (!item) return;
-    item.el.classList.add('err');
-    item.badgeEl.textContent = '失敗';
-
-    let hint = ERROR_HINTS[data.code] ?? '';
-    if (['BOT_CHECK', 'CLIENT_OUTDATED', 'FETCH_BLOCKED'].includes(data.code)
-        && engines.includes('gemini') && submittedEngine === 'workers-ai') {
-      hint += ' 解析方法を「動画を解析」に切り替えると、この制限を受けずに要約できます。';
-    }
-    let html = `<strong>${escapeHtml(data.message)}</strong>${escapeHtml(hint)}`;
-    const attempts = data.detail?.attempts;
-    if (Array.isArray(attempts) && attempts.length) {
-      const rows = attempts
-        .map((a) => `${escapeHtml(a.source ?? '?')}: ${escapeHtml(a.error ?? '')}`)
-        .join('\n');
-      html += `<details><summary>取得を試みた経路 (${attempts.length}件)</summary><pre>${rows}</pre></details>`;
-    }
-    const box = document.createElement('div');
-    box.className = 'item-err';
-    box.innerHTML = html;
-    item.bodyEl.after(box);
+    if (item) markError(item, data);
   }
 
   else if (event === 'done') {
     clearProgress();
-    if (data.failed > 0) {
-      showAlert(`${data.total} 本中 ${data.succeeded} 本を要約しました`, `\n${data.failed} 本は失敗しています。各カードの理由をご確認ください。`);
-    }
-    if (data.succeeded > 1) bulkBox.classList.add('on');
+    showSummary(data.total, data.succeeded, data.failed);
   }
 
   else if (event === 'fatal') {
     clearProgress();
     showAlert(data.message, `\nここまでに ${data.succeeded} 本の要約が完了しています。`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Gemini 経路: 依頼して受付番号を受け取り、完了するまで問い合わせる
+//
+// Gemini は動画を読み終えるまで応答を返し始めない。Cloudflare は外部への通信が
+// 約100秒応答しないと打ち切るため、Worker に待たせず、依頼と問い合わせに分ける。
+// ---------------------------------------------------------------------------
+
+const POLL_MS = 4000;
+const JOB_TIMEOUT_MS = 15 * 60 * 1000;
+
+class JobError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+/** 中断できる待機。待っている間も経過時間の表示を更新する */
+async function wait(ms, signal, onTick) {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (signal?.aborted) throw new DOMException('aborted', 'AbortError');
+    onTick?.();
+    await new Promise((r) => setTimeout(r, Math.min(1000, until - Date.now())));
+  }
+}
+
+/** Gemini に要約 (draft があればその検証) を依頼する */
+async function startJob(payload, signal) {
+  const res = await fetch('/api/gemini/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    signal,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new JobError(data.code ?? 'GEMINI_ERROR', data.error ?? `サーバーエラー (HTTP ${res.status})`);
+  return data;
+}
+
+/** 依頼した処理が終わるまで問い合わせ、要約本文を返す */
+async function waitForJob(id, { signal, onTick }) {
+  const startedAt = Date.now();
+  let networkFailures = 0;
+
+  while (true) {
+    await wait(POLL_MS, signal, onTick);
+    if (Date.now() - startedAt > JOB_TIMEOUT_MS) {
+      throw new JobError('GEMINI_TIMEOUT', 'Gemini の処理が15分以内に終わりませんでした。');
+    }
+
+    let res;
+    try {
+      res = await fetch(`/api/gemini/status?id=${encodeURIComponent(id)}`, { signal });
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      // 一時的な通信断は問い合わせ直せば済む。処理自体は Google 側で続いている
+      if (++networkFailures >= 5) {
+        throw new JobError('NETWORK', '通信が不安定なため、Gemini の結果を受け取れませんでした。');
+      }
+      continue;
+    }
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new JobError(data.code ?? 'GEMINI_ERROR', data.error ?? `サーバーエラー (HTTP ${res.status})`);
+    networkFailures = 0;
+
+    if (!data.done) continue;
+    if (data.error) throw new JobError(data.error.code, data.error.message);
+    return { text: data.text, truncated: Boolean(data.truncated) };
+  }
+}
+
+/** Gemini が失敗したとき、字幕経路で作り直してよいか */
+function canFallback() {
+  return engineMode === 'auto' && submittedEngine === defaultEngine && engines.includes('workers-ai');
+}
+
+async function runGeminiBatch(urls, { length, review, signal }) {
+  // サーバーの /api/summarize と同じ規則で、重複を除いて上限まで採用する
+  const seen = new Set();
+  const videos = [];
+  const invalid = [];
+  let overflow = 0;
+  for (const input of urls) {
+    const videoId = extractVideoId(input);
+    if (!videoId) { invalid.push(input); continue; }
+    if (seen.has(videoId)) continue;
+    seen.add(videoId);
+    if (videos.length >= maxUrls) { overflow++; continue; }
+    videos.push({ input, videoId });
+  }
+
+  if (!videos.length) {
+    throw new Error(invalid.length
+      ? 'YouTube の URL として認識できませんでした。動画ページの URL を貼り付けてください。'
+      : 'URL を入力してください。');
+  }
+
+  const notes = [];
+  if (invalid.length) notes.push(`URL として認識できなかった行が ${invalid.length} 件あります: ${invalid.join(' / ')}`);
+  if (overflow) notes.push(`一度に処理できるのは ${maxUrls} 本までです。先頭から ${maxUrls} 本を処理します。`);
+  if (notes.length) showAlert('一部の入力は処理されません', '\n' + notes.join('\n'));
+
+  videos.forEach((v, i) => createItem(i, v.videoId, v.input));
+
+  let succeeded = 0;
+  let failed = 0;
+
+  for (const [i, video] of videos.entries()) {
+    const item = items.get(i);
+    const prefix = videos.length > 1 ? `(${i + 1}/${videos.length}) ` : '';
+
+    try {
+      await summarizeWithGemini(item, video, { length, review, signal, prefix });
+      succeeded++;
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+
+      if (!canFallback()) {
+        markError(item, { code: err.code, message: err.message });
+        failed++;
+        continue;
+      }
+
+      item.fellBack = `Gemini が使えなかったため、字幕から要約しました（${err.message}）`;
+      item.noteEl.textContent = `Gemini が使えませんでした（${err.message}）。字幕から要約します…`;
+      item.bodyEl.innerHTML = '';
+      item.markdown = '';
+      setProgress(`${prefix}字幕から要約に切り替えています…`);
+      try {
+        await streamCaptions({ urls: [video.input], length, review }, { signal, target: item });
+      } catch (fallbackErr) {
+        if (fallbackErr.name === 'AbortError') throw fallbackErr;
+        markError(item, { code: 'INTERNAL', message: fallbackErr.message });
+      }
+      item.el.classList.contains('done') ? succeeded++ : failed++;
+    }
+  }
+
+  clearProgress();
+  showSummary(videos.length, succeeded, failed);
+}
+
+/** 1本の動画を Gemini で要約し、カードに表示する */
+async function summarizeWithGemini(item, video, { length, review, signal, prefix }) {
+  item.badgeEl.textContent = '処理中';
+  const startedAt = Date.now();
+  const say = (message) => () =>
+    setProgress(`${prefix}${message}（${Math.floor((Date.now() - startedAt) / 1000)}秒経過）`);
+
+  say('Gemini に依頼しています…')();
+
+  // 長すぎて断られたら、解析の解像度を下げて1度だけやり直す
+  let resolution;
+  let job;
+  let draft;
+  while (true) {
+    try {
+      job = await startJob({ url: video.input, length, resolution }, signal);
+      if (job.info) applyMeta(item, job.videoId, job.info.title, [job.info.author, '音声と画面を解析']);
+      draft = await waitForJob(job.id, {
+        signal,
+        onTick: say(review ? '動画を解析して下書きを作成中…' : '動画を解析中…'),
+      });
+      break;
+    } catch (err) {
+      if (err.code === 'GEMINI_TOO_LONG' && !resolution) {
+        resolution = 'low';
+        continue;
+      }
+      throw err;
+    }
+  }
+
+  const render = (text) => {
+    item.markdown = text;
+    item.bodyEl.innerHTML = `<div class="summary">${renderMarkdown(text, item.videoId)}</div>`;
+  };
+  render(draft.text);
+
+  let result = draft;
+  let reviewError = null;
+  if (review) {
+    try {
+      const reviewJob = await startJob({ url: video.input, length, resolution, draft: draft.text }, signal);
+      result = await waitForJob(reviewJob.id, { signal, onTick: say('動画と突き合わせて検証中…') });
+      render(result.text);
+    } catch (err) {
+      if (err.name === 'AbortError') throw err;
+      // 検証に失敗しても下書きは使える
+      reviewError = err.message;
+    }
+  }
+
+  const notes = [];
+  if (result.truncated) notes.push('出力の上限に達したため、途中までの要約です。');
+  if (resolution) notes.push('動画が長いため、画面の解像度を下げて解析しました。');
+  if (reviewError) notes.push(`検証パスが失敗したため、検証前の内容を表示しています（${reviewError}）。`);
+  notes.push(`動画を解析 / ${job.model}`);
+  markDone(item, notes);
+}
+
+// ---------------------------------------------------------------------------
+// カードの表示
+// ---------------------------------------------------------------------------
+
+function applyMeta(item, videoId, title, bits) {
+  if (title) {
+    item.title = title;
+    item.titleEl.textContent = title;
+  }
+  item.el.querySelector('img').src = `https://i.ytimg.com/vi/${encodeURIComponent(videoId)}/mqdefault.jpg`;
+  item.metaEl.textContent = bits.filter(Boolean).join(' ・ ');
+}
+
+function markDone(item, notes) {
+  item.el.classList.add('done');
+  item.badgeEl.textContent = '完了';
+  item.bodyEl.innerHTML = `<div class="summary">${renderMarkdown(item.markdown, item.videoId)}</div>`;
+  addActions(item);
+  item.noteEl.textContent = notes.join(' ');
+}
+
+function markError(item, { code, message, detail }) {
+  item.el.classList.add('err');
+  item.badgeEl.textContent = '失敗';
+  // 途中の表示 (「検証結果を反映しています…」など) を残さない
+  if (!item.markdown) item.bodyEl.innerHTML = '';
+
+  let hint = ERROR_HINTS[code] ?? '';
+  if (['BOT_CHECK', 'CLIENT_OUTDATED', 'FETCH_BLOCKED'].includes(code)
+      && engines.includes('gemini') && submittedEngine === 'workers-ai') {
+    hint += ' 解析方法を「動画を解析」に切り替えると、この制限を受けずに要約できます。';
+  }
+  let html = `<strong>${escapeHtml(message ?? '要約に失敗しました')}</strong>${escapeHtml(hint)}`;
+  const attempts = detail?.attempts;
+  if (Array.isArray(attempts) && attempts.length) {
+    const rows = attempts
+      .map((a) => `${escapeHtml(a.source ?? '?')}: ${escapeHtml(a.error ?? '')}`)
+      .join('\n');
+    html += `<details><summary>取得を試みた経路 (${attempts.length}件)</summary><pre>${rows}</pre></details>`;
+  }
+  item.el.querySelector('.item-err')?.remove();
+  const box = document.createElement('div');
+  box.className = 'item-err';
+  box.innerHTML = html;
+  item.bodyEl.after(box);
+}
+
+function showSummary(total, succeeded, failed) {
+  if (failed > 0) {
+    showAlert(`${total} 本中 ${succeeded} 本を要約しました`, `\n${failed} 本は失敗しています。各カードの理由をご確認ください。`);
+  }
+  if (succeeded > 1) bulkBox.classList.add('on');
+}
+
+/** 各種 YouTube URL から動画IDを取り出す (サーバーの youtube.js と同じ規則) */
+function extractVideoId(input) {
+  const ID = /^[A-Za-z0-9_-]{11}$/;
+  const raw = (input ?? '').trim();
+  if (!raw) return null;
+  if (ID.test(raw)) return raw;
+
+  let url;
+  try {
+    url = new URL(raw.includes('://') ? raw : `https://${raw}`);
+  } catch {
+    return null;
+  }
+  const host = url.hostname.replace(/^www\.|^m\.|^music\./, '');
+  if (host === 'youtu.be') {
+    const id = url.pathname.split('/').filter(Boolean)[0];
+    return id && ID.test(id) ? id : null;
+  }
+  if (host !== 'youtube.com' && host !== 'youtube-nocookie.com') return null;
+
+  const v = url.searchParams.get('v');
+  if (v && ID.test(v)) return v;
+
+  const parts = url.pathname.split('/').filter(Boolean);
+  if (parts.length >= 2 && ['shorts', 'embed', 'live', 'v'].includes(parts[0]) && ID.test(parts[1])) {
+    return parts[1];
+  }
+  return null;
 }
 
 $('copy-all').addEventListener('click', async () => {
@@ -651,6 +926,8 @@ $('copy-all').addEventListener('click', async () => {
 // --- 使えるエンジンを調べて選択肢を出す ---
 let engines = ['workers-ai'];
 let defaultEngine = null;
+let engineMode = 'auto';
+let maxUrls = 5;
 /** 実行時に画面で選ばれていた解析方法。エラー時の案内の出し分けに使う */
 let submittedEngine = null;
 
@@ -664,15 +941,6 @@ function selectedEngine() {
   return form.querySelector('input[name="engine"]:checked')?.value ?? null;
 }
 
-/**
- * サーバーに送る解析方法。既定のまま変えていなければ送らない。
- * 送るとサーバーは「明示的に選ばれた」と扱い、Gemini が失敗しても
- * 字幕ベースに切り替えなくなるため。
- */
-function requestedEngine() {
-  const e = selectedEngine();
-  return e && e !== defaultEngine ? e : undefined;
-}
 
 function updateEngineHint() {
   const e = selectedEngine() ?? engines[0];
@@ -685,6 +953,8 @@ function updateEngineHint() {
     if (!res.ok) return;
     const health = await res.json();
     engines = health.engines ?? engines;
+    engineMode = health.engineMode ?? engineMode;
+    maxUrls = health.maxUrls ?? maxUrls;
 
     if (engines.length > 1) {
       $('engine-row').hidden = false;
