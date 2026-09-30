@@ -7,10 +7,19 @@
 
 import { extractVideoId, fetchTranscript, TranscriptError } from './youtube.js';
 import { summarize, LENGTH_PRESETS } from './summarize.js';
-import { geminiAvailable, summarizeVideo, fetchVideoInfo, GeminiError } from './gemini.js';
+import {
+  geminiAvailable,
+  startGeminiJob,
+  getGeminiJob,
+  fetchVideoInfo,
+  GeminiError,
+  DEFAULT_GEMINI_MODEL,
+} from './gemini.js';
 
 /** 1リクエストで受け付ける本文の最大サイズ */
 const MAX_BODY_BYTES = 8192;
+/** Gemini の検証依頼は下書きを載せるので大きめに取る */
+const MAX_GEMINI_BODY_BYTES = 128 * 1024;
 
 /**
  * 一度に処理できる動画の数の既定値。
@@ -58,8 +67,10 @@ export default {
         ok: true,
         engines: availableEngines(env),
         defaultEngine: resolveEngine(env, null),
+        // auto のときだけ、Gemini が失敗したら画面が字幕経路に切り替える
+        engineMode: env.ENGINE || 'auto',
         model: env.SUMMARY_MODEL ?? null,
-        geminiModel: geminiAvailable(env) ? (env.GEMINI_MODEL ?? 'gemini-3.8-flash') : null,
+        geminiModel: geminiAvailable(env) ? (env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL) : null,
         preferredLangs: env.PREFERRED_LANGS ?? null,
         maxUrls: maxUrls(env),
       });
@@ -70,6 +81,17 @@ export default {
         return json({ error: 'POST を使用してください' }, 405);
       }
       return handleSummarize(request, env);
+    }
+
+    if (url.pathname === '/api/gemini/start') {
+      if (request.method !== 'POST') {
+        return json({ error: 'POST を使用してください' }, 405);
+      }
+      return handleGeminiStart(request, env);
+    }
+
+    if (url.pathname === '/api/gemini/status') {
+      return handleGeminiStatus(url, env);
     }
 
     return json({ error: 'Not Found' }, 404);
@@ -144,7 +166,6 @@ async function handleSummarize(request, env) {
   const length = Object.hasOwn(LENGTH_PRESETS, body?.length) ? body.length : 'standard';
   // 検証パスはモデルをもう一度呼ぶため、明示的に false のときだけ省略する
   const review = body?.review !== false;
-  const engine = resolveEngine(env, typeof body?.engine === 'string' ? body.engine : null);
   const preferredLangs = (env.PREFERRED_LANGS ?? 'ja,en')
     .split(',')
     .map((s) => s.trim().toLowerCase())
@@ -173,7 +194,7 @@ async function handleSummarize(request, env) {
           invalid,
           truncated,
           limit,
-          engine,
+          engine: 'workers-ai',
         });
 
         // 1本ずつ順に処理する。並行にすると YouTube 側の制限に当たりやすく、
@@ -186,9 +207,7 @@ async function handleSummarize(request, env) {
               total: videos.length,
               length,
               review,
-              engine,
               preferredLangs,
-              autoEngine: (env.ENGINE || 'auto') === 'auto' && !body?.engine,
               send,
             });
             succeeded++;
@@ -243,64 +262,15 @@ async function handleSummarize(request, env) {
 }
 
 /**
- * 1本の動画を処理し、進捗と本文を index つきで送る。
+ * 1本の動画を字幕経路で処理し、進捗と本文を index つきで送る。
  *
- * Gemini が使える設定なら先にそちらを試す。エンジンを明示指定されておらず
- * 自動選択の場合にかぎり、Gemini が失敗したら字幕ベースに切り替える。
- * 無料枠を使い切った日でもツールが止まらないようにするため。
+ * Gemini 経路はここを通らない。Gemini は動画を読み終えるまで応答を返さず、
+ * Cloudflare の約100秒の待ち時間の上限を超えるため、受付と問い合わせに
+ * 分けた /api/gemini/* を画面側から呼ぶ。
  */
 async function summarizeOne(env, params) {
-  const { engine, autoEngine, index, total, send } = params;
-  const position = total > 1 ? `(${index + 1}/${total}) ` : '';
-  const say = (phase, message) => send('status', { index, phase, message: `${position}${message}` });
-
-  if (engine === 'gemini') {
-    try {
-      return await runGeminiEngine(env, params, position);
-    } catch (err) {
-      if (!autoEngine) throw err;
-      console.error('gemini failed, falling back to captions', err);
-      say('fallback', `Gemini が使えませんでした（${err?.message ?? '原因不明'}）。字幕ベースに切り替えます…`);
-      send('reset', { index, text: '' });
-    }
-  }
-
+  const position = params.total > 1 ? `(${params.index + 1}/${params.total}) ` : '';
   return runCaptionEngine(env, params, position);
-}
-
-/** Gemini に YouTube の URL を渡して要約する */
-async function runGeminiEngine(env, { video, index, length, review, send }, position) {
-  const say = (phase, message) => send('status', { index, phase, message: `${position}${message}` });
-
-  say('fetching', '動画の情報を取得中…');
-
-  // 題名が取れなくても要約はできるので、失敗しても進む
-  const info = await fetchVideoInfo(video.videoId);
-  send('meta', {
-    index,
-    videoId: video.videoId,
-    title: info?.title ?? video.input,
-    author: info?.author ?? '',
-    lengthSeconds: null,
-    source: 'gemini',
-  });
-
-  const result = await summarizeVideo(env, {
-    videoId: video.videoId,
-    length,
-    review,
-    onStatus: (s) => send('status', { ...s, index, message: `${position}${s.message ?? ''}` }),
-    onDelta: (d) => send('delta', { index, text: d }),
-    onReset: (text) => send('reset', { index, text: text ?? '' }),
-  });
-
-  send('item-done', {
-    index,
-    engine: 'gemini',
-    model: result.model,
-    reviewed: result.reviewed,
-    reviewError: result.reviewError ?? null,
-  });
 }
 
 /** 字幕を取得して Workers AI で要約する */
@@ -339,6 +309,69 @@ async function runCaptionEngine(env, { video, index, length, review, preferredLa
     reviewed: result.reviewed,
     reviewError: result.reviewError ?? null,
   });
+}
+
+/**
+ * Gemini に要約 (または下書きの検証) を依頼し、受付番号を返す。
+ * 依頼するだけなのですぐ終わる。
+ */
+async function handleGeminiStart(request, env) {
+  if (!geminiAvailable(env)) {
+    return json({ code: 'GEMINI_UNAVAILABLE', error: 'Gemini の API キーが設定されていません。' }, 400);
+  }
+
+  const contentLength = Number(request.headers.get('content-length') ?? 0);
+  if (contentLength > MAX_GEMINI_BODY_BYTES) {
+    return json({ error: 'リクエストが大きすぎます' }, 413);
+  }
+
+  let body;
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: 'リクエストの形式が不正です' }, 400);
+  }
+
+  const videoId = extractVideoId(body?.url ?? '');
+  if (!videoId) {
+    return json({ code: 'BAD_URL', error: 'YouTube の URL として認識できませんでした。' }, 400);
+  }
+
+  const length = Object.hasOwn(LENGTH_PRESETS, body?.length) ? body.length : 'standard';
+  const draft = typeof body?.draft === 'string' && body.draft.trim() ? body.draft : undefined;
+  const resolution = body?.resolution === 'low' ? 'low' : undefined;
+
+  try {
+    // 題名は要約の依頼と並行して取る。取れなくても要約はできる
+    const [job, info] = await Promise.all([
+      startGeminiJob(env, { videoId, length, draft, resolution }),
+      draft ? Promise.resolve(null) : fetchVideoInfo(videoId),
+    ]);
+    return json({ id: job.id, status: job.status, model: job.model, videoId, info });
+  } catch (err) {
+    return geminiErrorResponse(err);
+  }
+}
+
+/** 依頼した処理の状態を返す。画面が数秒おきに呼ぶ */
+async function handleGeminiStatus(url, env) {
+  if (!geminiAvailable(env)) {
+    return json({ code: 'GEMINI_UNAVAILABLE', error: 'Gemini の API キーが設定されていません。' }, 400);
+  }
+  try {
+    return json(await getGeminiJob(env, url.searchParams.get('id') ?? ''));
+  } catch (err) {
+    return geminiErrorResponse(err);
+  }
+}
+
+function geminiErrorResponse(err) {
+  if (err instanceof GeminiError) {
+    const status = err.code === 'GEMINI_BAD_REQUEST' ? 400 : 502;
+    return json({ code: err.code, error: err.message }, status);
+  }
+  console.error('gemini request failed', err);
+  return json({ code: 'INTERNAL', error: `Gemini の呼び出しに失敗しました: ${err?.message ?? '原因不明'}` }, 500);
 }
 
 function json(data, status = 200) {
