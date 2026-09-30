@@ -247,7 +247,7 @@
 <div class="wrap">
   <header>
     <h1>YouTube 要約ツール</h1>
-    <p>動画の URL を貼り付けると、字幕をもとに内容を日本語で要約します。複数まとめて処理できます。</p>
+    <p>動画の URL を貼り付けると、内容を日本語で要約します。複数まとめて処理できます。</p>
   </header>
 
   <form class="card" id="form">
@@ -285,14 +285,13 @@
       <span>
         内容を検証して補正する
         <span class="sub">
-          下書きを字幕・説明欄と突き合わせ、聞き取り誤りの表記や抜けを直します。
+          下書きを元の動画と突き合わせ、聞き取り誤りの表記や抜けを直します。
           根拠のない情報は追加しません。時間が約2倍かかります。
         </span>
       </span>
     </label>
 
     <p class="hint">
-      字幕（自動生成を含む）が付いている動画のみ対応しています。
       複数指定した場合は1本ずつ順に処理します。長い動画・本数が多いほど時間がかかります。
     </p>
   </form>
@@ -473,12 +472,13 @@ form.addEventListener('submit', async (e) => {
 
   const controller = new AbortController();
   inFlight = controller;
+  submittedEngine = selectedEngine() ?? engines[0];
 
   try {
     const res = await fetch('/api/summarize', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ urls, length, review: $('review').checked, engine: selectedEngine() }),
+      body: JSON.stringify({ urls, length, review: $('review').checked, engine: requestedEngine() }),
       signal: controller.signal,
     });
 
@@ -599,7 +599,11 @@ function handleEvent(block) {
     item.el.classList.add('err');
     item.badgeEl.textContent = '失敗';
 
-    const hint = ERROR_HINTS[data.code] ?? '';
+    let hint = ERROR_HINTS[data.code] ?? '';
+    if (['BOT_CHECK', 'CLIENT_OUTDATED', 'FETCH_BLOCKED'].includes(data.code)
+        && engines.includes('gemini') && submittedEngine === 'workers-ai') {
+      hint += ' 解析方法を「動画を解析」に切り替えると、この制限を受けずに要約できます。';
+    }
     let html = `<strong>${escapeHtml(data.message)}</strong>${escapeHtml(hint)}`;
     const attempts = data.detail?.attempts;
     if (Array.isArray(attempts) && attempts.length) {
@@ -646,15 +650,28 @@ $('copy-all').addEventListener('click', async () => {
 
 // --- 使えるエンジンを調べて選択肢を出す ---
 let engines = ['workers-ai'];
+let defaultEngine = null;
+/** 実行時に画面で選ばれていた解析方法。エラー時の案内の出し分けに使う */
+let submittedEngine = null;
 
 const ENGINE_NOTES = {
-  gemini: '動画の音声と画面を直接解析します。画面に表示された URL やコードも読み取れ、字幕が無い動画にも対応します。無料枠は1日あたり動画8時間までです。',
-  'workers-ai': '字幕を取得して要約します。回数の制限が緩い一方、画面にしか出ていない情報は拾えません。',
+  gemini: '動画の音声と画面を直接解析します。画面に表示された URL やコードも読み取れ、字幕が無い動画にも対応します。公開動画のみ対応・無料枠は1日あたり動画8時間までです。',
+  'workers-ai': '字幕を取得して要約します。字幕（自動生成を含む）が付いた動画のみ対応です。YouTube に一時的にアクセスを制限されることがあり、画面にしか出ていない情報は拾えません。',
 };
 
 function selectedEngine() {
   if (engines.length < 2) return null;
   return form.querySelector('input[name="engine"]:checked')?.value ?? null;
+}
+
+/**
+ * サーバーに送る解析方法。既定のまま変えていなければ送らない。
+ * 送るとサーバーは「明示的に選ばれた」と扱い、Gemini が失敗しても
+ * 字幕ベースに切り替えなくなるため。
+ */
+function requestedEngine() {
+  const e = selectedEngine();
+  return e && e !== defaultEngine ? e : undefined;
 }
 
 function updateEngineHint() {
@@ -672,6 +689,7 @@ function updateEngineHint() {
     if (engines.length > 1) {
       $('engine-row').hidden = false;
       const pref = health.defaultEngine ?? engines[0];
+      defaultEngine = pref;
       const radio = form.querySelector(`input[name="engine"][value="${pref}"]`);
       if (radio) radio.checked = true;
       for (const r of form.querySelectorAll('input[name="engine"]')) {
